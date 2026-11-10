@@ -1,0 +1,66 @@
+name: CI-CD demo pipeline
+
+on:
+  push:
+    branches: [main]
+    paths: ["CI-CD/**", ".github/workflows/ci-cd-demo.yml"]
+  pull_request:
+    paths: ["CI-CD/**", ".github/workflows/ci-cd-demo.yml"]
+
+defaults:
+  run:
+    working-directory: CI-CD
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: CI-CD/requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check . && ruff format --check .
+      - name: Unit tests
+        run: pytest --cov=app --cov-report=term-missing
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - name: SAST (bandit)
+        run: bandit -r app scripts -q
+      - name: Dependency audit (pip-audit)
+        run: pip-audit -r requirements.txt
+
+  build-deploy-validate:
+    needs: [lint-test, security]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t netauto-api:${{ github.sha }} .
+      - name: Scan image (trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: netauto-api:${{ github.sha }}
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+      - name: Deploy (ephemeral container)
+        run: docker run -d --name netauto-api -p 8000:8000 netauto-api:${{ github.sha }}
+      - name: Post-deploy smoke tests
+        run: python scripts/smoke_test.py http://localhost:8000
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs netauto-api
